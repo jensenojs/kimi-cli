@@ -1,0 +1,267 @@
+# 专题 3: 工具系统设计与实现
+
+## 3.1 架构概览
+
+工具系统采用**插件化 + 依赖注入**架构：
+
+```
+工具规范 (YAML) → 工具加载 → 工具实例化 → 工具执行
+```
+
+**状态管理挑战**：
+- 工具需要**动态发现**和**懒加载**
+- 工具间需要**状态隔离**（避免相互污染）
+- 工具需要**统一接口**（类型安全）
+
+## 3.2 工具加载机制
+
+### 3.2.1 工具规范定义
+
+```python
+# src/kimi_cli/tools/__init__.py 中的工具注册
+TOOL_MODULES = {
+    "bash": "kimi_cli.tools.bash",
+    "file": "kimi_cli.tools.file",
+    "web": "kimi_cli.tools.web",
+    "task": "kimi_cli.tools.task",
+    "think": "kimi_cli.tools.think",
+    "todo": "kimi_cli.tools.todo",
+    "dmail": "kimi_cli.tools.dmail",
+}
+```
+
+**状态设计**：
+- **集中注册表**：模块级字典（加载时确定）
+- **字符串标识**：避免循环导入（解耦状态）
+
+### 3.2.2 动态加载实现
+
+```python
+# src/kimi_cli/tools/__init__.py
+def load_tool(tool_name: str, tool_config: dict[str, Any]) -> CallableTool:
+    """Load a tool by name."""
+    module_name = TOOL_MODULES.get(tool_name)
+    if module_name is None:
+        raise ValueError(f"Unknown tool: {tool_name}")
+    
+    module = importlib.import_module(module_name)
+    # 调用模块的 load() 函数（约定优于配置）
+    return module.load(tool_config)
+```
+
+**调用链路**：
+```
+Agent 初始化
+└── load_toolset()
+    ├── 遍历 tools 列表
+    ├── load_tool() 动态导入
+    └── 返回 CallableTool 列表
+```
+
+**状态隔离**：
+- 每个工具**独立模块**（命名空间隔离）
+- 工具配置**独立传递**（配置隔离）
+
+## 3.3 工具接口设计
+
+### 3.3.1 CallableTool 协议
+
+```python
+# 基于 kosong.tooling.CallableTool
+class CallableTool(Protocol):
+    name: str
+    description: str
+    parameters: dict[str, Any]  # JSON Schema
+    
+    async def __call__(self, **kwargs: Any) -> ToolReturnType:
+        """工具执行入口"""
+        ...
+```
+
+**状态设计**：
+- **不可变元数据**：`name`, `description`, `parameters`（类级别）
+- **无状态执行**：`__call__` 不依赖实例状态（函数式）
+
+### 3.3.2 工具实现模式
+
+以 `bash` 工具为例：
+
+```python
+# src/kimi_cli/tools/bash/__init__.py
+class BashTool(CallableTool):
+    def __init__(self, config: dict[str, Any]):
+        self.name = "Bash"
+        self.description = "Execute shell commands"
+        self.parameters = {  # JSON Schema
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "Shell command to execute"},
+                "timeout": {"type": "number", "description": "Timeout in seconds"}
+            },
+            "required": ["command"]
+        }
+        self._timeout = config.get("timeout", 60)  # 配置状态
+    
+    async def __call__(self, command: str, timeout: int | None = None) -> ToolReturnType:
+        # 执行逻辑（无状态）
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=self._work_dir,  # 运行时状态注入
+        )
+        # ...
+```
+
+**状态分类**：
+- **配置状态**：`_timeout`（初始化时确定）
+- **运行时状态**：`command`, `timeout` 参数（每次调用不同）
+- **依赖状态**：`_work_dir`（外部注入）
+
+## 3.4 MCP (Model Context Protocol) 集成
+
+### 3.4.1 MCPTool 适配器模式
+
+```python
+# src/kimi_cli/tools/mcp.py:11-25
+class MCPTool[T: ClientTransport](CallableTool):
+    """适配器：将 MCP 工具转换为 CallableTool"""
+    
+    def __init__(self, mcp_tool: mcp.Tool, client: fastmcp.Client[T], **kwargs: Any):
+        super().__init__(
+            name=mcp_tool.name,
+            description=mcp_tool.description or "",
+            parameters=mcp_tool.inputSchema,  # 直接复用 Schema
+            **kwargs,
+        )
+        self._mcp_tool = mcp_tool  # 被适配对象
+        self._client = client  # MCP 客户端状态
+    
+    async def __call__(self, *args: Any, **kwargs: Any) -> ToolReturnType:
+        async with self._client as client:
+            # 委托给 MCP 实现
+            result = await client.call_tool(self._mcp_tool.name, kwargs, timeout=20)
+            return convert_tool_result(result)  # 类型转换
+```
+
+**状态管理**：
+- **适配器持有**：MCP 客户端状态（连接池）
+- **类型转换**：MCP 类型 → Kosong 类型（边界状态转换）
+
+### 3.4.2 结果转换（状态映射）
+
+```python
+# src/kimi_cli/tools/mcp.py:28-82
+def convert_tool_result(result: CallToolResult) -> ToolReturnType:
+    content: list[ContentPart] = []
+    for part in result.content:
+        match part:
+            case mcp.types.TextContent(text=text):
+                content.append(TextPart(text=text))  # 类型映射
+            
+            case mcp.types.ImageContent(data=data, mimeType=mimeType):
+                content.append(
+                    ImageURLPart(
+                        image_url=ImageURLPart.ImageURL(
+                            url=f"data:{mimeType};base64,{data}"  # 格式转换
+                        )
+                    )
+                )
+            # ... 其他类型
+```
+
+**调用链路**：
+```
+LLM 调用工具
+└── MCPTool.__call__()
+    ├── client.call_tool()  # MCP 协议调用
+    ├── 返回 CallToolResult
+    └── convert_tool_result()  # 状态转换
+        └── ToolReturnType  # Kosong 类型
+```
+
+## 3.5 工具状态提取（调试用）
+
+```python
+# src/kimi_cli/tools/__init__.py:17-82
+def extract_key_argument(json_content: str, tool_name: str) -> str | None:
+    """从工具参数中提取关键信息（用于日志/显示）"""
+    curr_args: JsonType = json.loads(json_str)
+    
+    match tool_name:
+        case "Task":
+            return str(curr_args["description"])  # 任务描述
+        case "Bash":
+            return str(curr_args["command"])  # 命令内容
+        case "ReadFile" | "WriteFile":
+            return _normalize_path(str(curr_args["path"]))  # 文件路径
+        # ... 其他工具
+    
+    # 默认：截断显示
+    return shorten_middle(key_argument, width=50)
+```
+
+**状态设计**：
+- **只读提取**：不修改原始状态
+- **信息压缩**：长文本截断（显示状态优化）
+
+---
+
+# 总结：上下文工程最佳实践
+
+## 1. 状态分层原则
+
+```
+配置状态（启动时） → 会话状态（运行时） → 临时状态（函数内）
+   ↓ 不可变            ↓ 可回溯           ↓ 用完即弃
+```
+
+## 2. 状态持久化模式
+
+```python
+# 模式 1：双写（内存 + 磁盘）
+self._history.append(message)  # 内存
+await f.write(json.dumps(...))  # 磁盘
+
+# 模式 2：事件溯源（JSON Lines）
+{"role": "user", "content": "..."}
+{"role": "_checkpoint", "id": 1}
+{"role": "_usage", "token_count": 1000}
+
+# 模式 3：文件轮转（历史保留）
+mv context.json context.json.1  # 原子操作
+```
+
+## 3. 状态回溯机制
+
+```python
+# 核心：异常作为控制流
+class BackToTheFuture(Exception):
+    """携带回溯目标状态"""
+    def __init__(self, checkpoint_id: int, messages: list[Message]):
+        self.checkpoint_id = checkpoint_id  # 目标状态 ID
+        self.messages = messages  # 回溯后追加的消息
+
+# 使用
+try:
+    finished = await self._step()
+except BackToTheFuture as e:
+    await self._context.revert_to(e.checkpoint_id)  # 状态恢复
+    await self._checkpoint()
+    await self._context.append_message(e.messages)  # 状态修正
+    continue  # 重试
+```
+
+## 4. 状态压缩策略
+
+**何时压缩**：`token_count + reserved_tokens >= max_context_size`
+
+**压缩什么**：保留最近 N 条消息，其余摘要
+
+**压缩代价**：丢失细节，但保留**语义状态**
+
+## 5. 状态隔离
+
+- **工具状态**：模块级隔离（import 机制）
+- **会话状态**：Context 实例隔离（多会话支持）
+- **配置状态**：NamedTuple 不可变（防止意外修改）

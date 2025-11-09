@@ -1,0 +1,336 @@
+# 专题 2: Soul 核心架构与上下文管理
+
+## 2.1 架构概览
+
+Soul 是**事件驱动**的智能体执行引擎，核心状态：
+
+```
+Context (历史消息) → KimiSoul (执行引擎) → Runtime (运行时依赖)
+```
+
+**状态管理挑战**：
+- 消息历史可能**无限增长**（内存/Token 限制）
+- 工具执行可能**失败/中断**（需要回溯）
+- LLM 调用可能**超时/异常**（需要重试）
+
+## 2.2 Context - 持久化状态管理
+
+### 2.2.1 状态存储设计
+
+```python
+# src/kimi_cli/soul/context.py:14-20
+class Context:
+    def __init__(self, file_backend: Path):
+        self._file_backend = file_backend  # 持久化后端
+        self._history: list[Message] = []  # 内存缓存
+        self._token_count: int = 0         # Token 使用状态
+        self._next_checkpoint_id: int = 0  # Checkpoint 计数器
+```
+
+**状态双模式**：
+- **内存状态**：`_history` 列表，快速访问
+- **磁盘状态**：`file_backend` JSON Lines 格式，持久化
+
+### 2.2.2 状态恢复（生命周期起点）
+
+```python
+# src/kimi_cli/soul/context.py:22-48
+async def restore(self) -> bool:
+    # 防御性检查：避免重复恢复
+    if self._history:
+        raise RuntimeError("The context storage is already modified")
+    
+    if not self._file_backend.exists():
+        return False  # 无状态可恢复
+    
+    async with aiofiles.open(self._file_backend, encoding="utf-8") as f:
+        async for line in f:
+            line_json = json.loads(line)
+            
+            # 元数据处理（非消息状态）
+            if line_json["role"] == "_usage":
+                self._token_count = line_json["token_count"]
+                continue
+            if line_json["role"] == "_checkpoint":
+                self._next_checkpoint_id = line_json["id"] + 1
+                continue
+            
+            # 消息状态恢复
+            message = Message.model_validate(line_json)
+            self._history.append(message)
+```
+
+**调用链路**：
+```
+Session 初始化
+└── Context.restore()
+    ├── 检查文件存在性
+    ├── 逐行解析 JSON
+    ├── 区分元数据（_usage, _checkpoint）
+    └── 反序列化 Message
+```
+
+### 2.2.3 Checkpoint 机制（状态快照）
+
+```python
+# src/kimi_cli/soul/context.py:62-72
+async def checkpoint(self, add_user_message: bool):
+    checkpoint_id = self._next_checkpoint_id
+    self._next_checkpoint_id += 1  # 状态变更
+    
+    # 持久化 checkpoint 标记
+    async with aiofiles.open(self._file_backend, "a", encoding="utf-8") as f:
+        await f.write(json.dumps({"role": "_checkpoint", "id": checkpoint_id}) + "\n")
+    
+    if add_user_message:
+        # 在消息历史中插入标记
+        await self.append_message(
+            Message(role="user", content=[system(f"CHECKPOINT {checkpoint_id}")])
+        )
+```
+
+**状态语义**：
+- **Checkpoint = 可回溯点**
+- 每个 checkpoint 有**唯一 ID**（递增）
+- 持久化 + 内存**双重记录**（一致性保证）
+
+### 2.2.4 状态回溯（时间旅行）
+
+```python
+# src/kimi_cli/soul/context.py:74-127
+async def revert_to(self, checkpoint_id: int):
+    # 防御性检查
+    if checkpoint_id >= self._next_checkpoint_id:
+        raise ValueError(f"Checkpoint {checkpoint_id} does not exist")
+    
+    # 文件轮转（保留历史）
+    rotated_file_path = await next_available_rotation(self._file_backend)
+    await aiofiles.os.rename(self._file_backend, rotated_file_path)
+    
+    # 重置内存状态
+    self._history.clear()
+    self._token_count = 0
+    self._next_checkpoint_id = 0
+    
+    # 从轮转文件重建状态
+    async with (
+        aiofiles.open(rotated_file_path, encoding="utf-8") as old_file,
+        aiofiles.open(self._file_backend, "w", encoding="utf-8") as new_file,
+    ):
+        async for line in old_file:
+            line_json = json.loads(line)
+            
+            # 在指定 checkpoint 处停止
+            if line_json["role"] == "_checkpoint" and line_json["id"] == checkpoint_id:
+                break
+            
+            await new_file.write(line)  # 写入新文件
+            # 重建内存状态...
+```
+
+**状态管理精髓**：
+- **原子性**：文件轮转 + 重建是原子操作
+- **可追溯**：轮转文件保留完整历史
+- **一致性**：内存与磁盘状态同步重建
+
+## 2.3 KimiSoul - 执行引擎状态机
+
+### 2.3.1 初始化状态
+
+```python
+# src/kimi_cli/soul/kimisoul.py:51-83
+def __init__(self, agent: Agent, runtime: Runtime, *, context: Context):
+    self._agent = agent  # 不可变配置状态
+    self._runtime = runtime  # 运行时依赖状态
+    self._context = context  # 可变会话状态
+    self._compaction = SimpleCompaction()  # 压缩策略状态
+    self._reserved_tokens = RESERVED_TOKENS  # 预留 token 状态
+    self._thinking_effort: ThinkingEffort = "off"  # LLM 行为状态
+    
+    # Checkpoint 行为配置（基于工具存在性）
+    for tool in agent.toolset.tools:
+        if tool.name == SendDMail_NAME:
+            self._checkpoint_with_user_message = True
+            break
+```
+
+**状态分类**：
+- **配置状态**：`_agent`, `_runtime`（只读）
+- **会话状态**：`_context`（读写）
+- **行为状态**：`_thinking_effort`（动态调整）
+
+### 2.3.2 主循环状态流转
+
+```python
+# src/kimi_cli/soul/kimisoul.py:146-196
+async def _agent_loop(self):
+    step_no = 1
+    while True:
+        wire_send(StepBegin(step_no))  # 事件通知
+        
+        try:
+            # 上下文过长检测（状态监控）
+            if (self._context.token_count + self._reserved_tokens 
+                >= self._runtime.llm.max_context_size):
+                logger.info("Context too long, compacting...")
+                wire_send(CompactionBegin())
+                await self.compact_context()  # 状态压缩
+                wire_send(CompactionEnd())
+            
+            await self._checkpoint()  # 创建回溯点
+            self._denwa_renji.set_n_checkpoints(self._context.n_checkpoints)
+            
+            finished = await self._step()  # 执行单步
+            
+        except BackToTheFuture as e:  # 时间旅行异常
+            await self._context.revert_to(e.checkpoint_id)  # 状态回溯
+            await self._checkpoint()
+            await self._context.append_message(e.messages)
+            continue  # 重试当前步骤
+        
+        except (ChatProviderError, asyncio.CancelledError):
+            wire_send(StepInterrupted())
+            raise  # 终止循环
+        
+        if finished:
+            return  # 正常结束
+        
+        step_no += 1
+        if step_no > self._loop_control.max_steps_per_run:
+            raise MaxStepsReached(...)  # 状态保护
+```
+
+**状态机模式**：
+```
+[Start] → [Checkpoint] → [Step] → [Check Finish]
+   ↑           ↓
+   └─[BackToTheFuture]─[Revert]─[Retry]
+```
+
+### 2.3.3 单步执行与状态增长
+
+```python
+# src/kimi_cli/soul/kimisoul.py:197-248
+async def _step(self) -> bool:
+    # 重试逻辑（状态保护）
+    @tenacity.retry(
+        retry=retry_if_exception(self._is_retryable_error),
+        stop=stop_after_attempt(self._loop_control.max_retries_per_step),
+    )
+    async def _kosong_step_with_retry() -> StepResult:
+        return await kosong.step(
+            chat_provider.with_thinking(self._thinking_effort),
+            self._agent.system_prompt,
+            self._agent.toolset,
+            self._context.history,  # 传递当前状态
+            on_message_part=wire_send,
+            on_tool_result=wire_send,
+        )
+    
+    result = await _kosong_step_with_retry()
+    
+    if result.usage is not None:
+        # 更新 token 使用状态
+        await self._context.update_token_count(result.usage.input)
+        wire_send(StatusUpdate(status=self.status))
+    
+    # 等待工具结果（可能中断）
+    results = await result.tool_results()
+    
+    # 保护状态更新（屏蔽中断）
+    await asyncio.shield(self._grow_context(result, results))
+    
+    # 处理拒绝（状态回退）
+    rejected = any(isinstance(result.result, ToolRejectedError) for result in results)
+    if rejected:
+        _ = self._denwa_renji.fetch_pending_dmail()
+        return True  # 提前终止
+```
+
+**状态增长模式**：
+```
+Context (旧状态)
+    ↓
+LLM 调用（生成新消息）
+    ↓
+工具执行（生成工具结果）
+    ↓
+asyncio.shield() 保护状态更新
+    ↓
+Context (新状态)
+```
+
+## 2.4 上下文压缩（状态优化）
+
+### 2.4.1 压缩触发条件
+
+```python
+# src/kimi_cli/soul/kimisoul.py:165-172
+if (self._context.token_count + self._reserved_tokens 
+    >= self._runtime.llm.max_context_size):
+    logger.info("Context too long, compacting...")
+    wire_send(CompactionBegin())
+    await self.compact_context()  # 状态转换
+    wire_send(CompactionEnd())
+```
+
+**状态监控**：持续跟踪 `token_count`，预防性压缩
+
+### 2.4.2 SimpleCompaction 策略
+
+```python
+# src/kimi_cli/soul/compaction.py:33-55
+class SimpleCompaction(Compaction):
+    MAX_PRESERVED_MESSAGES = 2  # 保留最近 2 条消息
+    
+    async def compact(self, messages: Sequence[Message], llm: LLM) -> Sequence[Message]:
+        history = list(messages)
+        
+        # 保留策略：最近 user/assistant 消息
+        preserve_start_index = len(history)
+        n_preserved = 0
+        for index in range(len(history) - 1, -1, -1):
+            if history[index].role in {"user", "assistant"}:
+                n_preserved += 1
+                if n_preserved == self.MAX_PRESERVED_MESSAGES:
+                    preserve_start_index = index
+                    break
+        
+        to_compact = history[:preserve_start_index]  # 待压缩
+        to_preserve = history[preserve_start_index:]  # 保留
+        
+        # 使用 LLM 压缩历史
+        history_text = "\n\n".join(
+            f"## Message {i + 1}\nRole: {msg.role}\nContent: {msg.content}"
+            for i, msg in enumerate(to_compact)
+        )
+        
+        # 生成压缩摘要
+        compacted_msg, usage = await generate(
+            chat_provider=llm.chat_provider,
+            system_prompt="You are a helpful assistant that compacts conversation context.",
+            history=[Message(role="user", content=compact_prompt)],
+        )
+        
+        # 重建状态：摘要 + 保留消息
+        content: list[ContentPart] = [
+            system("Previous context has been compacted. Here is the compaction output:")
+        ]
+        content.extend(compacted_msg.content)
+        
+        compacted_messages: list[Message] = [Message(role="assistant", content=content)]
+        compacted_messages.extend(to_preserve)
+        return compacted_messages
+```
+
+**状态转换**：
+```
+[Message 1, Message 2, ..., Message N-2, Message N-1, Message N]
+   ↓ 压缩
+[Summary(1..N-2), Message N-1, Message N]
+```
+
+**权衡分析**：
+- **优势**：减少 token 使用，保留关键上下文
+- **代价**：丢失细节，可能丢失重要信息
+- **改进方向**：基于重要性评分选择性保留

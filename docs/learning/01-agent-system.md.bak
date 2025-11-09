@@ -1,0 +1,127 @@
+# 专题 1: Agent 系统与规范加载机制
+
+## 1.1 架构概览
+
+Agent 系统采用**分层状态管理**设计，核心状态流转：
+
+```
+YAML 文件 → AgentSpec (原始) → ResolvedAgentSpec (解析后)
+```
+
+**状态维度分析**：
+
+| 维度 | 设计 | 权衡 |
+|------|------|------|
+| **位置** | `agents/` 目录 + 继承链 | 集中管理 vs 灵活扩展 |
+| **生命周期** | 加载时解析，运行时不可变 | 性能优化 vs 动态调整 |
+| **作用域** | 全局唯一（按名称） | 命名冲突风险 vs 简单实现 |
+
+## 1.2 核心代码解析
+
+### 1.2.1 AgentSpec 数据模型
+
+```python
+# src/kimi_cli/agentspec.py:17-30
+class AgentSpec(BaseModel):
+    """Agent specification - 原始配置状态"""
+    
+    extend: str | None = Field(default=None)  # 继承指针
+    name: str | None = Field(default=None)    # 最终状态标识
+    system_prompt_path: Path | None = Field(default=None)
+    system_prompt_args: dict[str, str] = Field(default_factory=dict)
+    tools: list[str] | None = Field(default=None)  # 工具列表状态
+    exclude_tools: list[str] | None = Field(default=None)
+    subagents: dict[str, "SubagentSpec"] | None = Field(default=None)
+```
+
+**状态管理关键点**：
+- 所有字段可为 `None`，表示**未设置状态**
+- `default_factory=dict` 避免**可变默认参数陷阱**（状态隔离）
+- Pydantic 提供**运行时类型验证**（状态完整性保证）
+
+### 1.2.2 继承机制与状态合并
+
+```python
+# src/kimi_cli/agentspec.py:95-114
+if agent_spec.extend:
+    # 加载父配置（递归解析）
+    base_agent_spec = _load_agent_spec(base_agent_file)
+    
+    # 状态合并策略（非简单覆盖）
+    if agent_spec.name is not None:
+        base_agent_spec.name = agent_spec.name  # 覆盖
+    if agent_spec.system_prompt_path is not None:
+        base_agent_spec.system_prompt_path = agent_spec.system_prompt_path  # 覆盖
+    
+    # 关键：system_prompt_args 是合并而非覆盖
+    for k, v in agent_spec.system_prompt_args.items():
+        base_agent_spec.system_prompt_args[k] = v  # 增量更新
+    
+    if agent_spec.tools is not None:
+        base_agent_spec.tools = agent_spec.tools  # 完全覆盖
+    # ...
+    agent_spec = base_agent_spec  # 状态转移
+```
+
+**调用链路**：
+```
+load_agent_spec()
+└── _load_agent_spec() [递归]
+    ├── yaml.safe_load()  # 原始文本 → 字典状态
+    ├── AgentSpec(**data)  # 字典 → 结构化状态
+    ├── 路径解析（相对 → 绝对）
+    └── 继承链解析（递归合并）
+```
+
+### 1.2.3 ResolvedAgentSpec - 不可变状态
+
+```python
+# src/kimi_cli/agentspec.py:40-48
+class ResolvedAgentSpec(NamedTuple):
+    """Resolved agent specification - 最终不可变状态"""
+    
+    name: str  # 不再可为 None
+    system_prompt_path: Path
+    system_prompt_args: dict[str, str]
+    tools: list[str]  # 明确的状态集合
+    exclude_tools: list[str]
+    subagents: dict[str, "SubagentSpec"]
+```
+
+**设计动机**：
+- `NamedTuple` 提供**不可变性**（状态安全）
+- 加载后不可变，避免**运行时状态漂移**
+- 明确区分**配置阶段**和**运行阶段**的状态
+
+## 1.3 上下文工程实践
+
+### 1.3.1 路径状态管理
+
+```python
+# src/kimi_cli/agentspec.py:90-94
+if agent_spec.system_prompt_path is not None:
+    # 状态转换：相对路径 → 绝对路径
+    agent_spec.system_prompt_path = agent_file.parent / agent_spec.system_prompt_path
+
+if agent_spec.subagents is not None:
+    for v in agent_spec.subagents.values():
+        # 统一路径基准，避免**状态歧义**
+        v.path = agent_file.parent / v.path
+```
+
+**问题本质**：路径是**相对状态**，依赖**上下文（agent_file.parent）**
+- **集中化**：在加载时统一转换，避免运行时重复计算
+- **不可变**：转换后不再变更，保证状态一致性
+
+### 1.3.2 工具列表状态策略
+
+```python
+# 继承时的工具状态合并
+if agent_spec.tools is not None:
+    base_agent_spec.tools = agent_spec.tools  # 完全覆盖，非合并
+```
+
+**权衡分析**：
+- **优势**：子 Agent 可**精确控制**工具集（避免工具污染）
+- **代价**：无法增量添加工具（灵活性降低）
+- **替代方案**：可设计为 `tools: list[str] | Literal["inherit"]`
